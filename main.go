@@ -1,98 +1,170 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
-	"log"
-	"refactor/interfaces"
-	"refactor/notification"
-	"refactor/repository"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
 )
 
-// OrderService - основной сервис для работы с заказами
-type OrderService struct {
-	repo     interfaces.RepositoryWriter
-	notifier interfaces.Notifier
-}
+func Validate(v any) error {
+	val := reflect.ValueOf(v)
+	typ := reflect.TypeOf(v)
 
-func NewOrderService(repo interfaces.RepositoryWriter, notifier interfaces.Notifier) *OrderService {
-	return &OrderService{
-		repo:     repo,
-		notifier: notifier,
-	}
-}
-
-func (s *OrderService) CreateOrder(customer string, products []string, total float64) error {
-	// Создание объекта заказа
-	order := &interfaces.Order{
-		Customer: customer,
-		Products: fmt.Sprintf("%v", products),
-		Total:    total,
-		Status:   "pending",
+	// Проверяем, что передан указатель или структура
+	if val.Kind() == reflect.Ptr {
+		val = val.Elem()
+		typ = typ.Elem()
 	}
 
-	// Сохранение в БД
-	if err := s.repo.Save(order); err != nil {
-		return fmt.Errorf("ошибка сохранения заказа: %w", err)
+	if val.Kind() != reflect.Struct {
+		return fmt.Errorf("Validate ожидает структуру, получен %s", val.Kind())
 	}
 
-	// Отправка уведомления
-	message := fmt.Sprintf("Ваш заказ на сумму %.2f создан", total)
-	if err := s.notifier.Notify(customer, message); err != nil {
-		return fmt.Errorf("ошибка отправки уведомления: %w", err)
+	// Проходим по всем полям структуры
+	for i := 0; i < val.NumField(); i++ {
+		field := typ.Field(i)
+		fieldValue := val.Field(i)
+		tag := field.Tag.Get("validate")
+
+		// Пропускаем поля без тега validate
+		if tag == "" {
+			continue
+		}
+
+		// Разбиваем тег на отдельные правила
+		rules := strings.Split(tag, ";")
+
+		// Проверяем каждое правило для поля
+		for _, rule := range rules {
+			rule = strings.TrimSpace(rule)
+			if rule == "" {
+				continue
+			}
+
+			// Разбиваем правило на ключ и значение
+			parts := strings.SplitN(rule, "=", 2)
+			if len(parts) != 2 {
+				continue // Пропускаем некорректные правила
+			}
+
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+
+			// Проверяем правило в зависимости от типа поля
+			switch fieldValue.Kind() {
+			case reflect.String:
+				strValue := fieldValue.String()
+				if err := validateStringField(strValue, key, value, field.Name); err != nil {
+					return err
+				}
+
+			case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+				intValue := fieldValue.Int()
+				if err := validateIntField(intValue, key, value, field.Name); err != nil {
+					return err
+				}
+
+			default:
+				// Для других типов пропускаем проверку
+				continue
+			}
+		}
 	}
 
 	return nil
 }
 
+// validateStringField проверяет строковые поля
+func validateStringField(value, ruleKey, ruleValue, fieldName string) error {
+	switch ruleKey {
+	case "min":
+		min, err := strconv.Atoi(ruleValue)
+		if err != nil {
+			return fmt.Errorf("неверный формат min для поля %s: %v", fieldName, err)
+		}
+		// Используем руны для корректного подсчета символов (включая юникод)
+		if len([]rune(value)) < min {
+			return fmt.Errorf("поле %s должно содержать минимум %d символов", fieldName, min)
+		}
+
+	case "max":
+		max, err := strconv.Atoi(ruleValue)
+		if err != nil {
+			return fmt.Errorf("неверный формат max для поля %s: %v", fieldName, err)
+		}
+		if len([]rune(value)) > max {
+			return fmt.Errorf("поле %s должно содержать максимум %d символов", fieldName, max)
+		}
+
+	case "regexp":
+		// Проверяем регулярное выражение
+		matched, err := regexp.MatchString(ruleValue, value)
+		if err != nil {
+			return fmt.Errorf("некорректное регулярное выражение для поля %s: %v", fieldName, err)
+		}
+		if !matched {
+			return fmt.Errorf("поле %s не соответствует формату", fieldName)
+		}
+	}
+
+	return nil
+}
+
+// validateIntField проверяет целочисленные поля
+func validateIntField(value int64, ruleKey, ruleValue, fieldName string) error {
+	switch ruleKey {
+	case "min":
+		min, err := strconv.ParseInt(ruleValue, 10, 64)
+		if err != nil {
+			return fmt.Errorf("неверный формат min для поля %s: %v", fieldName, err)
+		}
+		if value < min {
+			return fmt.Errorf("поле %s должно быть не меньше %d", fieldName, min)
+		}
+
+	case "max":
+		max, err := strconv.ParseInt(ruleValue, 10, 64)
+		if err != nil {
+			return fmt.Errorf("неверный формат max для поля %s: %v", fieldName, err)
+		}
+		if value > max {
+			return fmt.Errorf("поле %s должно быть не больше %d", fieldName, max)
+		}
+	}
+
+	return nil
+}
+
+// Пример использования
+type User struct {
+	Name  string `validate:"min=3"`
+	Age   int    `validate:"min=18;max=65"`
+	Email string `validate:"regexp=^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"`
+}
+
 func main() {
-	// Инициализация базы данных
-	db, err := sql.Open("sqlite3", "orders.db")
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	// Создание репозитория
-	repo := repository.NewSQLiteOrderRepository(db)
-
-	// Инициализация таблиц
-	if err := repo.Init(); err != nil {
-		log.Fatal(err)
+	// Тестовые случаи
+	fmt.Println("Тест 1 - Короткое имя:")
+	if err := Validate(User{Name: "Ив", Age: 18, Email: "test@example.com"}); err != nil {
+		fmt.Println("Validation error:", err)
 	}
 
-	fmt.Println("=== Пример 1: Использование EmailSender ===")
-	emailNotifier := notification.NewEmailSender()
-	emailService := NewOrderService(repo, emailNotifier)
-
-	err = emailService.CreateOrder("Иван", []string{"apple", "banana"}, 10.5)
-	if err != nil {
-		log.Fatal(err)
+	fmt.Println("\nТест 2 - Возраст больше максимума:")
+	if err := Validate(User{Name: "Иван", Age: 70, Email: "test@example.com"}); err != nil {
+		fmt.Println("Validation error:", err)
 	}
 
-	fmt.Println("\n=== Пример 2: Использование SMSSender ===")
-	smsNotifier := notification.NewSMSSender()
-	smsService := NewOrderService(repo, smsNotifier)
-
-	err = smsService.CreateOrder("Мария", []string{"milk", "bread"}, 7.8)
-	if err != nil {
-		log.Fatal(err)
+	fmt.Println("\nТест 3 - Неверный email:")
+	if err := Validate(User{Name: "Иван", Age: 35, Email: "invalid email"}); err != nil {
+		fmt.Println("Validation error:", err)
 	}
 
-	fmt.Println("\n=== Пример 3: Легкое переключение между отправителями ===")
-
-	// Можно динамически выбирать тип уведомления
-	var notifier interfaces.Notifier
-
-	// Выбираем email для VIP клиентов
-	notifier = notification.NewEmailSender()
-	vipService := NewOrderService(repo, notifier)
-	vipService.CreateOrder("VIP Клиент", []string{"wine", "cheese"}, 50.0)
-
-	// Выбираем SMS для обычных клиентов
-	notifier = notification.NewSMSSender()
-	regularService := NewOrderService(repo, notifier)
-	regularService.CreateOrder("Обычный Клиент", []string{"water", "juice"}, 3.5)
-
-	fmt.Println("\n✅ Все заказы успешно обработаны!")
+	fmt.Println("\nТест 4 - Все поля валидны:")
+	if err := Validate(User{Name: "Иван", Age: 35, Email: "test@example.com"}); err != nil {
+		fmt.Println("Validation error:", err)
+	} else {
+		fmt.Println("Валидация пройдена успешно!")
+	}
 }
